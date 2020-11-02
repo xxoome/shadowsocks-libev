@@ -61,12 +61,16 @@
 #define EWOULDBLOCK EAGAIN
 #endif
 
-#ifndef SOCKET_BUF_SIZE
-#define SOCKET_BUF_SIZE 2048
-#endif
-
 #ifndef IP6T_SO_ORIGINAL_DST
 #define IP6T_SO_ORIGINAL_DST 80
+#endif
+
+#ifndef IP_TRANSPARENT
+#define IP_TRANSPARENT       19
+#endif
+
+#ifndef IPV6_TRANSPARENT
+#define IPV6_TRANSPARENT     75
 #endif
 
 static void accept_cb(EV_P_ ev_io *w, int revents);
@@ -93,13 +97,15 @@ static int mode      = TCP_ONLY;
 #ifdef HAVE_SETRLIMIT
 static int nofile = 0;
 #endif
-       int fast_open = 0;
-static int no_delay  = 0;
-static int ret_val   = 0;
+int fast_open       = 0;
+static int no_delay = 0;
+static int ret_val  = 0;
 
 static struct ev_signal sigint_watcher;
 static struct ev_signal sigterm_watcher;
 static struct ev_signal sigchld_watcher;
+
+static int tcp_tproxy = 0; /* use tproxy instead of redirect (for tcp) */
 
 static int
 getdestaddr(int fd, struct sockaddr_storage *destaddr)
@@ -107,12 +113,17 @@ getdestaddr(int fd, struct sockaddr_storage *destaddr)
     socklen_t socklen = sizeof(*destaddr);
     int error         = 0;
 
-    error = getsockopt(fd, SOL_IPV6, IP6T_SO_ORIGINAL_DST, destaddr, &socklen);
-    if (error) { // Didn't find a proper way to detect IP version.
-        error = getsockopt(fd, SOL_IP, SO_ORIGINAL_DST, destaddr, &socklen);
-        if (error) {
-            return -1;
+    if (tcp_tproxy) {
+        error = getsockname(fd, (void *)destaddr, &socklen);
+    } else {
+        error = getsockopt(fd, SOL_IPV6, IP6T_SO_ORIGINAL_DST, destaddr, &socklen);
+        if (error) { // Didn't find a proper way to detect IP version.
+            error = getsockopt(fd, SOL_IP, SO_ORIGINAL_DST, destaddr, &socklen);
         }
+    }
+
+    if (error) {
+        return -1;
     }
     return 0;
 }
@@ -167,6 +178,23 @@ create_and_bind(const char *addr, const char *port)
             if (err == 0) {
                 LOGI("tcp port reuse enabled");
             }
+        }
+
+        if (tcp_tproxy) {
+            int level = 0, optname = 0;
+            if (rp->ai_family == AF_INET) {
+                level = IPPROTO_IP;
+                optname = IP_TRANSPARENT;
+            } else {
+                level = IPPROTO_IPV6;
+                optname = IPV6_TRANSPARENT;
+            }
+
+            if (setsockopt(listen_sock, level, optname, &opt, sizeof(opt)) != 0) {
+                ERROR("setsockopt IP_TRANSPARENT");
+                exit(EXIT_FAILURE);
+            }
+            LOGI("tcp tproxy mode enabled");
         }
 
         s = bind(listen_sock, rp->ai_addr, rp->ai_addrlen);
@@ -756,8 +784,13 @@ accept_cb(EV_P_ ev_io *w, int revents)
     setnonblocking(remotefd);
 
     if (listener->tos >= 0) {
-        if (setsockopt(remotefd, IPPROTO_IP, IP_TOS, &listener->tos, sizeof(listener->tos)) != 0) {
-            ERROR("setsockopt IP_TOS");
+        int rc = setsockopt(remotefd, IPPROTO_IP, IP_TOS, &listener->tos, sizeof(listener->tos));
+        if (rc < 0 && errno != ENOPROTOOPT) {
+            LOGE("setting ipv4 dscp failed: %d", errno);
+        }
+        rc = setsockopt(remotefd, IPPROTO_IPV6, IPV6_TCLASS, &listener->tos, sizeof(listener->tos));
+        if (rc < 0 && errno != ENOPROTOOPT) {
+            LOGE("setting ipv6 dscp failed: %d", errno);
         }
     }
 
@@ -874,14 +907,14 @@ main(int argc, char **argv)
         { "password",    required_argument, NULL, GETOPT_VAL_PASSWORD    },
         { "key",         required_argument, NULL, GETOPT_VAL_KEY         },
         { "help",        no_argument,       NULL, GETOPT_VAL_HELP        },
-        { NULL,                          0, NULL,                      0 }
+        { NULL,          0,                 NULL, 0                      }
     };
 
     opterr = 0;
 
     USE_TTY();
 
-    while ((c = getopt_long(argc, argv, "f:s:p:l:k:t:m:c:b:a:n:huUv6A",
+    while ((c = getopt_long(argc, argv, "f:s:p:l:k:t:m:c:b:a:n:huUTv6A",
                             long_options, NULL)) != -1) {
         switch (c) {
         case GETOPT_VAL_FAST_OPEN:
@@ -956,6 +989,9 @@ main(int argc, char **argv)
         case 'U':
             mode = UDP_ONLY;
             break;
+        case 'T':
+            tcp_tproxy = 1;
+            break;
         case 'v':
             verbose = 1;
             break;
@@ -1028,6 +1064,9 @@ main(int argc, char **argv)
         if (mode == TCP_ONLY) {
             mode = conf->mode;
         }
+        if (tcp_tproxy == 0) {
+            tcp_tproxy = conf->tcp_tproxy;
+        }
         if (mtu == 0) {
             mtu = conf->mtu;
         }
@@ -1078,7 +1117,7 @@ main(int argc, char **argv)
     }
 
     if (method == NULL) {
-        method = "rc4-md5";
+        method = "chacha20-ietf-poly1305";
     }
 
     if (timeout == NULL) {
